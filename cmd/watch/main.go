@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -15,7 +16,12 @@ import (
 )
 
 var outboxes = make(map[string]*outbox)
-var globalLock = &sync.RWMutex{}
+var globalLock = &lock{}
+
+type lock struct {
+	ModifiedIndex uint64
+	sync.RWMutex
+}
 
 func etcdAPI(endpoints []string) (client.KeysAPI, error) {
 	c, err := client.New(client.Config{
@@ -29,7 +35,7 @@ func etcdAPI(endpoints []string) (client.KeysAPI, error) {
 	return client.NewKeysAPI(c), nil
 }
 
-type callback func(data string)
+type callback func(node *client.Node) error
 
 func get(kapi client.KeysAPI, key string, fn callback) {
 	resp, err := kapi.Get(context.TODO(), key, nil)
@@ -38,8 +44,12 @@ func get(kapi client.KeysAPI, key string, fn callback) {
 		log.Printf("!! ERR: %v\n", err)
 		return
 	}
-	fn(resp.Node.Value)
 
+	if err := fn(resp.Node); err != nil {
+		log.Printf("!! ERR: %v\n", err)
+		log.Printf("!! Calling get again")
+		get(kapi, key, fn)
+	}
 }
 
 func watch(kapi client.KeysAPI, key string, fn callback) {
@@ -51,7 +61,11 @@ func watch(kapi client.KeysAPI, key string, fn callback) {
 			log.Printf("!! ERR: %v\n", err)
 			break
 		}
-		fn(resp.Node.Value)
+		if err := fn(resp.Node); err != nil {
+			// we got an outdated node. we should trigger a get
+			// to ensure we get the latest value.
+			get(kapi, key, fn)
+		}
 	}
 
 }
@@ -67,14 +81,14 @@ func main() {
 	token := flag.String("token", "", "token to watch")
 	flag.Parse()
 
-	go get(kapi, *token, func(data string) {
-		log.Printf("get: apply called with %s\n", data)
-		apply(data)
+	go get(kapi, *token, func(node *client.Node) error {
+		log.Printf("get: apply called with %s -> %d\n", node.Value, node.ModifiedIndex)
+		return apply(node)
 	})
 
-	go watch(kapi, *token, func(data string) {
-		log.Printf("watch: apply called with %s\n", data)
-		apply(data)
+	go watch(kapi, *token, func(node *client.Node) error {
+		log.Printf("watch: apply called with %s -> %d\n", node.Value, node.ModifiedIndex)
+		return apply(node)
 	})
 
 	streamLogLines()
@@ -154,14 +168,23 @@ func errNotFound(err error) bool {
 	return false
 }
 
-func apply(payload string) {
-	log.Printf("apply(%s)\n", payload)
+func apply(node *client.Node) error {
+	log.Printf("apply(%+v)\n", node)
 
 	var v []string
-	json.Unmarshal([]byte(payload), &v)
+	json.Unmarshal([]byte(node.Value), &v)
 
 	globalLock.Lock()
 	defer globalLock.Unlock()
+
+	if node.ModifiedIndex < globalLock.ModifiedIndex {
+		return fmt.Errorf("Trying to update stale data")
+	}
+
+	if node.ModifiedIndex == globalLock.ModifiedIndex {
+		log.Printf("Got the same index; no need to do `apply`")
+		return nil
+	}
 
 	for _, url := range v {
 		if _, ok := outboxes[url]; !ok {
@@ -176,6 +199,8 @@ func apply(payload string) {
 			outbox.stop()
 		}
 	}
+
+	return nil
 }
 
 func contains(list []string, elem string) bool {

@@ -1,0 +1,27 @@
+#!/usr/bin/env ruby
+
+require "json"
+
+
+key = ARGV[0] || abort("Usage: #{$0} <key> [sleep delay]")
+delay = Integer(ARGV[1] || 1)
+
+drains = %w[
+	http://0.0.0.0:5000/logs
+	http://0.0.0.0:5100/logs
+	http://0.0.0.0:5300/logs
+]
+
+def run(cmd)
+	$stderr.puts(cmd)
+	$stderr.puts(`#{cmd}`)
+end
+
+# Flush out the output immediately
+STDOUT.sync = true
+STDERR.sync = true
+
+loop do
+	run "etcdctl set '#{key}' '#{JSON.dump(drains.shuffle.take(rand(drains.size)+1))}'"
+	sleep delay
+end

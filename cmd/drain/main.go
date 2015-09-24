@@ -21,7 +21,10 @@ type handler struct {
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	body, _ := ioutil.ReadAll(r.Body)
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+	}
 	log.Printf("PORT=%s LOG=%s", h.Port, body)
 	defer r.Body.Close()
 
